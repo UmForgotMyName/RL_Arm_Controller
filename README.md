@@ -1,4 +1,4 @@
-# 🤖 RL Arm Controller (Isaac Lab 5.1 + RSL-RL PPO)
+# 🦾 RL Arm Controller (Isaac Lab 5.1 + RSL-RL PPO)
 
 <div align="center">
 
