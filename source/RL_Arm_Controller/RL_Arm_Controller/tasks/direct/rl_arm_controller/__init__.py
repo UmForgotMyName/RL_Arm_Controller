@@ -13,7 +13,7 @@ from . import agents
 
 
 gym.register(
-    id="Template-Rl-Arm-Controller-Direct-v0",
+    id="Isaac-Reach-Fanuc-v0",
     entry_point=f"{__name__}.rl_arm_controller_env:RlArmControllerEnv",
     disable_env_checker=True,
     kwargs={
