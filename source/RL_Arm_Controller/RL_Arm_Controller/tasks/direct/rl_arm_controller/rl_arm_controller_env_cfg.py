@@ -53,14 +53,14 @@ class SuccessRateCurriculumCfg:
 
 @configclass
 class RlArmControllerEnvCfg(DirectRLEnvCfg):
-    # env
+    # ---- Env ----
     decimation = 2
     episode_length_s = 6.0
     action_space = 6
     observation_space = 0
     state_space = 0
 
-    # simulation
+    # ---- Simulation ----
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 120,
         render_interval=decimation,
@@ -70,23 +70,24 @@ class RlArmControllerEnvCfg(DirectRLEnvCfg):
         ),
     )
 
-    # robot
+    # ---- Robot ----
     robot_cfg: ArticulationCfg = FANUC_LRMATE_SG2_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     joint_names = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"]
     tcp_body_name = "tcp"
     tcp_prim_path = "/lrmate200ic5l_with_sg2/link_6/flange/tool0/sg2/tcp"
     tcp_forward_axis = (0.0, 0.0, 1.0)
 
-    # scene
+    # ---- Scene ----
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
         num_envs=1024, env_spacing=4.0, replicate_physics=True, clone_in_fabric=True
     )
 
-    # targets
+    # ---- Targets ----
     target_pos_range = ((0.35, 0.65), (-0.35, 0.35), (0.2, 0.6))
     target_min_distance_from_base = 0.2
     target_max_distance_from_base = 0.9
     target_resample_attempts = 30
+    reset_repair_attempts = 3
     use_ik_reachability = True
     ik_reachability_iters = 8
     ik_reachability_tolerance = 0.02
@@ -102,7 +103,7 @@ class RlArmControllerEnvCfg(DirectRLEnvCfg):
         },
     )
 
-    # obstacles
+    # ---- Obstacles ----
     num_obstacles = 2
     obstacle_pos_range = ((0.25, 0.6), (-0.3, 0.3), (0.15, 0.55))
     obstacle_size = (0.08, 0.08, 0.12)
@@ -111,6 +112,8 @@ class RlArmControllerEnvCfg(DirectRLEnvCfg):
     obstacle_min_distance_from_base = 0.2
     obstacle_resample_attempts = 40
     obstacle_inactive_pos = (0.0, 0.0, 10.0)
+    enable_los_clearance_check = True
+    los_clearance_margin = 0.02
     obstacle_cfg: RigidObjectCfg = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Obstacle_0",
         spawn=sim_utils.CuboidCfg(
@@ -133,7 +136,7 @@ class RlArmControllerEnvCfg(DirectRLEnvCfg):
         filter_prim_paths_expr=["/World/envs/env_.*/Robot/.*"],
     )
 
-    # control
+    # ---- Control ----
     action_scale = 0.5
     reset_joint_pos_noise = 0.05
     dof_velocity_scale = 0.1
@@ -141,7 +144,7 @@ class RlArmControllerEnvCfg(DirectRLEnvCfg):
     include_prev_actions = True
     obs_clip = 5.0
 
-    # rewards
+    # ---- Rewards ----
     rew_scale_dist = 1.0
     rew_scale_success = 5.0
     rew_scale_action = -0.01
@@ -154,6 +157,12 @@ class RlArmControllerEnvCfg(DirectRLEnvCfg):
     terminate_on_collision = False
     collision_force_threshold = 1.0
     invalid_target_fallback_radius = 0.05
+    enable_stuck_termination = False
+    stuck_min_progress = 0.005
+    stuck_steps = 60
+    invalid_fraction_ema_alpha = 0.05
+    invalid_fraction_window = 200
+    # ---- Curriculum ----
     curriculum: SuccessRateCurriculumCfg = SuccessRateCurriculumCfg()
 
     def __post_init__(self):

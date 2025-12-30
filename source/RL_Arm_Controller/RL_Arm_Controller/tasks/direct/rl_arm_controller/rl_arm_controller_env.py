@@ -25,6 +25,7 @@ class RlArmControllerEnv(DirectRLEnv):
     def __init__(self, cfg: RlArmControllerEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
 
+        # ---- Robot handles and kinematics ----
         self._joint_ids, _ = self._robot.find_joints(self.cfg.joint_names, preserve_order=True)
         self._tcp_body_idx = self._robot.find_bodies(self.cfg.tcp_body_name)[0][0]
 
@@ -39,11 +40,13 @@ class RlArmControllerEnv(DirectRLEnv):
             self._jacobi_body_idx = self._tcp_body_idx
             self._jacobi_joint_ids = [i + 6 for i in self._joint_ids]
 
+        # ---- Action buffers ----
         num_joints = len(self._joint_ids)
         self._actions = torch.zeros((self.num_envs, num_joints), device=self.device)
         self._prev_actions = torch.zeros_like(self._actions)
         self._joint_targets = self._default_joint_pos.clone()
 
+        # ---- Task state buffers ----
         self._target_pos = torch.zeros((self.num_envs, 3), device=self.device)
         self._obstacle_pos = torch.zeros((self.num_envs, self.cfg.num_obstacles, 3), device=self.device)
         self._prev_dist = torch.zeros(self.num_envs, device=self.device)
@@ -53,11 +56,33 @@ class RlArmControllerEnv(DirectRLEnv):
         self._episode_stats_initialized = False
         self._invalid_reset_count = 0
         self._total_reset_count = 0
+        self._degraded_reset_count = 0
+        self._degraded_target_count = 0
+        self._degraded_obstacle_count = 0
+        self._repair_attempts_total = 0
+        self._repair_attempts_count = 0
+        self._invalid_reset_ema = 0.0
+        self._invalid_reset_window = torch.zeros(
+            self.cfg.invalid_fraction_window, dtype=torch.bool, device=self.device
+        )
+        self._invalid_reset_window_idx = 0
+        self._invalid_reset_window_filled = 0
+        self._degraded_target_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._degraded_obstacle_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._best_dist = torch.zeros(self.num_envs, device=self.device)
+        self._stuck_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._stuck_terminated_count = 0
 
+        # ---- Geometry helpers ----
         self._tcp_forward_axis = torch.tensor(self.cfg.tcp_forward_axis, device=self.device).repeat(self.num_envs, 1)
         self._base_pos_local = torch.tensor(self.cfg.robot_cfg.init_state.pos, device=self.device)
+        obstacle_diag = torch.tensor(self.cfg.obstacle_size, device=self.device)
+        self._obstacle_clearance_radius = 0.5 * torch.linalg.norm(obstacle_diag) + self.cfg.los_clearance_margin
+        self._obstacle_inactive_pos = torch.tensor(self.cfg.obstacle_inactive_pos, device=self.device)
 
+        # ---- Visualization ----
         self._target_markers = VisualizationMarkers(self.cfg.target_marker_cfg)
+        # ---- Curriculum ----
         self._curriculum_cfg = self.cfg.curriculum
         self._curriculum_enabled = (
             self._curriculum_cfg is not None
@@ -71,16 +96,22 @@ class RlArmControllerEnv(DirectRLEnv):
         self._active_obstacle_count = self.cfg.num_obstacles
         if self._curriculum_enabled:
             self._apply_curriculum_stage(0)
+        else:
+            self._update_target_bounds_tensors()
         self._episode_success_history = torch.zeros(self._curriculum_cfg.window_size, device=self.device)
         self._episode_history_idx = 0
         self._episode_history_filled = 0
         self._success_rate = 0.0
+        stage_count = len(self._curriculum_cfg.stages) if self._curriculum_cfg is not None else 0
+        self._reset_count_by_stage = [0 for _ in range(stage_count)]
+        self._invalid_count_by_stage = [0 for _ in range(stage_count)]
+        self._degraded_count_by_stage = [0 for _ in range(stage_count)]
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot_cfg)
         self.scene.articulations["robot"] = self._robot
 
-        # spawn obstacles
+        # ---- Obstacles and contact sensors ----
         self._obstacles: list[RigidObject] = []
         self._obstacle_contact_sensors: list[ContactSensor] = []
         for i in range(self.cfg.num_obstacles):
@@ -94,19 +125,20 @@ class RlArmControllerEnv(DirectRLEnv):
             self._obstacle_contact_sensors.append(sensor)
             self.scene.sensors[f"obstacle_contact_sensor_{i}"] = sensor
 
-        # add ground plane
+        # ---- Static world ----
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
 
-        # clone and replicate
+        # ---- Clone environments ----
         self.scene.clone_environments(copy_from_source=False)
         # we need to explicitly filter collisions for CPU simulation
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=["/World/ground"])
-        # add lights
+        # ---- Lighting ----
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
+        # Clamp to action space and map to joint targets.
         self._actions = actions.clamp(-1.0, 1.0)
         targets = self._default_joint_pos + self.cfg.action_scale * self._actions
         self._joint_targets = torch.clamp(targets, self._dof_lower_limits, self._dof_upper_limits)
@@ -115,12 +147,14 @@ class RlArmControllerEnv(DirectRLEnv):
         self._robot.set_joint_position_target(self._joint_targets, joint_ids=self._joint_ids)
 
     def _get_observations(self) -> dict:
+        # ---- State terms ----
         joint_pos = self._robot.data.joint_pos[:, self._joint_ids]
         joint_vel = self._robot.data.joint_vel[:, self._joint_ids] * self.cfg.dof_velocity_scale
 
         tcp_pos = self._robot.data.body_pos_w[:, self._tcp_body_idx] - self.scene.env_origins
         target_rel = self._target_pos - tcp_pos
 
+        # ---- Assemble observation ----
         obs_terms = [self._scale_joint_pos(joint_pos), joint_vel, target_rel]
 
         if self.cfg.include_obstacle_obs:
@@ -133,11 +167,12 @@ class RlArmControllerEnv(DirectRLEnv):
         obs = torch.cat(obs_terms, dim=-1)
         obs = torch.clamp(obs, -self.cfg.obs_clip, self.cfg.obs_clip)
 
-        self._prev_actions = self._actions.clone()
+        self._prev_actions.copy_(self._actions)
 
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
+        # ---- Distance and progress ----
         tcp_pos = self._robot.data.body_pos_w[:, self._tcp_body_idx] - self.scene.env_origins
         to_target = self._target_pos - tcp_pos
         dist = torch.norm(to_target, dim=-1)
@@ -149,6 +184,7 @@ class RlArmControllerEnv(DirectRLEnv):
         progress = torch.where(self._has_prev_dist, progress, torch.zeros_like(progress))
         reward += self.cfg.rew_scale_progress * progress
 
+        # ---- Action regularization ----
         action_penalty = torch.sum(self._actions**2, dim=-1)
         reward += self.cfg.rew_scale_action * action_penalty
 
@@ -158,14 +194,17 @@ class RlArmControllerEnv(DirectRLEnv):
         joint_vel_penalty = torch.sum(self._robot.data.joint_vel[:, self._joint_ids] ** 2, dim=-1)
         reward += self.cfg.rew_scale_joint_vel * joint_vel_penalty
 
+        # ---- Optional orientation shaping ----
         if self.cfg.rew_scale_approach != 0.0:
             tcp_rot = self._robot.data.body_quat_w[:, self._tcp_body_idx]
             tcp_forward = quat_apply(tcp_rot, self._tcp_forward_axis)
             to_target_dir = normalize(to_target)
             reward += self.cfg.rew_scale_approach * torch.sum(tcp_forward * to_target_dir, dim=-1)
 
-        collision = self._check_obstacle_collision()
-        reward = torch.where(collision, reward + self.cfg.rew_scale_collision, reward)
+        # ---- Collision penalty ----
+        if self.cfg.rew_scale_collision != 0.0:
+            collision = self._check_obstacle_collision()
+            reward = torch.where(collision, reward + self.cfg.rew_scale_collision, reward)
         reward = torch.where(self._invalid_reset_buf, torch.zeros_like(reward), reward)
 
         self._prev_dist = dist
@@ -174,21 +213,33 @@ class RlArmControllerEnv(DirectRLEnv):
         return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        # ---- Termination conditions ----
         tcp_pos = self._robot.data.body_pos_w[:, self._tcp_body_idx] - self.scene.env_origins
         dist = torch.norm(self._target_pos - tcp_pos, dim=-1)
         success = dist < self._curr_success_tolerance
         self._success_buf = success
 
-        collision = self._check_obstacle_collision()
         terminated = success
         if self.cfg.terminate_on_collision:
+            collision = self._check_obstacle_collision()
             terminated = terminated | collision
 
         time_out = self.episode_length_buf >= self.max_episode_length - 1
+        if self.cfg.enable_stuck_termination:
+            # Track progress and truncate if there is no improvement for a while.
+            improved = dist < (self._best_dist - self.cfg.stuck_min_progress)
+            self._best_dist = torch.minimum(self._best_dist, dist)
+            self._stuck_steps = torch.where(improved, torch.zeros_like(self._stuck_steps), self._stuck_steps + 1)
+            stuck = (self._stuck_steps >= self.cfg.stuck_steps) & ~terminated
+            time_out = time_out | stuck
+            if stuck.any():
+                self._stuck_terminated_count += stuck.sum().item()
+        self.extras["Stats/stuck_terminated_count"] = float(self._stuck_terminated_count)
         time_out = time_out | self._invalid_reset_buf
         return terminated, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
+        # ---- Reset pipeline ----
         if env_ids is None:
             env_ids = self._robot._ALL_INDICES
         super()._reset_idx(env_ids)
@@ -223,28 +274,148 @@ class RlArmControllerEnv(DirectRLEnv):
         self.sim.forward()
         self.scene.update(dt=self.physics_dt)
 
-        target_valid = self._reset_targets(env_ids)
-        obstacle_valid = self._reset_obstacles(env_ids)
+        # ---- Sampling: targets then obstacles ----
+        target_valid, target_degraded = self._reset_targets(env_ids)
+        obstacle_valid, obstacle_degraded = self._reset_obstacles(env_ids)
         invalid_mask = ~(target_valid & obstacle_valid)
+        degraded_mask = target_degraded | obstacle_degraded
+        initial_invalid_mask = invalid_mask.clone()
+
+        # ---- Repair loop: resample only the failing envs ----
+        attempts_used = torch.zeros(len(env_ids), dtype=torch.long, device=self.device)
+        pending_mask = invalid_mask.clone()
+        if self.cfg.reset_repair_attempts > 0 and pending_mask.any():
+            for attempt in range(self.cfg.reset_repair_attempts):
+                if not pending_mask.any():
+                    break
+                pending_env_ids = env_ids[pending_mask]
+                target_valid_r, target_degraded_r = self._reset_targets(pending_env_ids)
+                obstacle_valid_r, obstacle_degraded_r = self._reset_obstacles(pending_env_ids)
+                invalid_r = ~(target_valid_r & obstacle_valid_r)
+                degraded_r = target_degraded_r | obstacle_degraded_r
+
+                invalid_mask[pending_mask] = invalid_r
+                target_degraded[pending_mask] = target_degraded_r
+                obstacle_degraded[pending_mask] = obstacle_degraded_r
+                degraded_mask[pending_mask] = degraded_r
+                attempts_used[pending_mask] = attempt + 1
+                pending_mask[pending_mask] = invalid_r
+
+        # ---- Hard fallback: last resort to keep episodes usable ----
+        if pending_mask.any():
+            pending_env_ids = env_ids[pending_mask]
+            self._apply_degraded_reset(pending_env_ids)
+            invalid_mask[pending_mask] = False
+            target_degraded[pending_mask] = True
+            obstacle_degraded[pending_mask] = True
+            degraded_mask[pending_mask] = True
+
         self._invalid_reset_buf[env_ids] = invalid_mask
+        self._degraded_target_buf[env_ids] = target_degraded
+        self._degraded_obstacle_buf[env_ids] = obstacle_degraded
+
+        raw_invalid_count = initial_invalid_mask.sum().item()
+        degraded_count = degraded_mask.sum().item()
+        degraded_target_count = target_degraded.sum().item()
+        degraded_obstacle_count = obstacle_degraded.sum().item()
+
         self._total_reset_count += len(env_ids)
-        self._invalid_reset_count += invalid_mask.sum().item()
-        self.extras["Stats/invalid_env_fraction"] = self._invalid_reset_count / max(1, self._total_reset_count)
+        self._invalid_reset_count += raw_invalid_count
+        self._degraded_reset_count += degraded_count
+        self._degraded_target_count += degraded_target_count
+        self._degraded_obstacle_count += degraded_obstacle_count
+
+        used_mask = attempts_used > 0
+        if used_mask.any():
+            self._repair_attempts_total += attempts_used[used_mask].sum().item()
+            self._repair_attempts_count += used_mask.sum().item()
+
+        # ---- Invalid stats: EMA + rolling window ----
+        invalid_fraction_batch = raw_invalid_count / max(1, len(env_ids))
+        alpha = self.cfg.invalid_fraction_ema_alpha
+        if alpha > 0.0:
+            self._invalid_reset_ema = (1.0 - alpha) * self._invalid_reset_ema + alpha * invalid_fraction_batch
+
+        invalid_window_fraction = 0.0
+        window_size = self._invalid_reset_window.numel()
+        if window_size > 0:
+            num = len(env_ids)
+            idxs = (torch.arange(num, device=self.device) + self._invalid_reset_window_idx) % window_size
+            self._invalid_reset_window[idxs] = initial_invalid_mask
+            self._invalid_reset_window_idx = (self._invalid_reset_window_idx + num) % window_size
+            self._invalid_reset_window_filled = min(window_size, self._invalid_reset_window_filled + num)
+            if self._invalid_reset_window_filled < window_size:
+                invalid_window_fraction = (
+                    self._invalid_reset_window[: self._invalid_reset_window_filled].float().mean().item()
+                )
+            else:
+                invalid_window_fraction = self._invalid_reset_window.float().mean().item()
+
+        # ---- Per-stage counters (curriculum) ----
+        if self._reset_count_by_stage:
+            stage_idx = self._curriculum_stage
+            self._reset_count_by_stage[stage_idx] += len(env_ids)
+            self._invalid_count_by_stage[stage_idx] += raw_invalid_count
+            self._degraded_count_by_stage[stage_idx] += degraded_count
+            for idx in range(len(self._reset_count_by_stage)):
+                self.extras[f"Stats/reset_count_stage_{idx}"] = float(self._reset_count_by_stage[idx])
+                self.extras[f"Stats/invalid_count_stage_{idx}"] = float(self._invalid_count_by_stage[idx])
+                self.extras[f"Stats/degraded_count_stage_{idx}"] = float(self._degraded_count_by_stage[idx])
+
+        self.extras["Stats/invalid_env_fraction"] = float(self._invalid_reset_ema)
+        self.extras["Stats/invalid_env_fraction_window"] = float(invalid_window_fraction)
         self.extras["Stats/invalid_env_count"] = float(self._invalid_reset_count)
+        self.extras["Stats/degraded_env_count"] = float(self._degraded_reset_count)
+        self.extras["Stats/degraded_env_fraction"] = float(
+            self._degraded_reset_count / max(1, self._total_reset_count)
+        )
+        self.extras["Stats/degraded_target_count"] = float(self._degraded_target_count)
+        self.extras["Stats/degraded_obstacle_count"] = float(self._degraded_obstacle_count)
+        self.extras["Stats/repair_attempts_used_avg"] = self._repair_attempts_total / max(
+            1, self._repair_attempts_count
+        )
         self.extras["Stats/reset_count"] = float(self._total_reset_count)
 
+        # ---- Buffer resets for new episode ----
         self._joint_targets[env_ids] = joint_pos[:, self._joint_ids]
         self._actions[env_ids] = 0.0
         self._prev_actions[env_ids] = 0.0
         self._prev_dist[env_ids] = 0.0
         self._has_prev_dist[env_ids] = False
+        tcp_pos = self._robot.data.body_pos_w[env_ids, self._tcp_body_idx] - self.scene.env_origins[env_ids]
+        self._best_dist[env_ids] = torch.norm(self._target_pos[env_ids] - tcp_pos, dim=-1)
+        self._stuck_steps[env_ids] = 0
 
-    def _reset_targets(self, env_ids: torch.Tensor) -> torch.Tensor:
+    def _apply_degraded_reset(self, env_ids: torch.Tensor) -> None:
+        # Fallback: target near TCP and inactive obstacles to keep episode usable.
+        if not torch.is_tensor(env_ids):
+            env_ids = torch.tensor(env_ids, device=self.device, dtype=torch.long)
+        if env_ids.numel() == 0:
+            return
+        tcp_pos = self._robot.data.body_pos_w[env_ids, self._tcp_body_idx] - self.scene.env_origins[env_ids]
+        offset = self._sample_uniform_pos(
+            len(env_ids), ((-1.0, 1.0), (-1.0, 1.0), (-1.0, 1.0))
+        ) * self.cfg.invalid_target_fallback_radius
+        target_pos = tcp_pos + offset
+        target_pos = torch.max(torch.min(target_pos, self._curr_target_max), self._curr_target_min)
+        self._target_pos[env_ids] = target_pos
+        self._update_target_markers()
+
+        inactive_pos = self._obstacle_inactive_pos
+        obstacle_pos = inactive_pos.view(1, 1, 3).expand(len(env_ids), self.cfg.num_obstacles, 3).clone()
+        self._obstacle_pos[env_ids] = obstacle_pos
+        self._write_obstacle_positions(env_ids, obstacle_pos)
+
+    def _reset_targets(self, env_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # Target sampling with optional IK reachability check.
         if not torch.is_tensor(env_ids):
             env_ids = torch.tensor(env_ids, device=self.device, dtype=torch.long)
         num_envs = len(env_ids)
         target_pos = torch.zeros((num_envs, 3), device=self.device)
         valid_mask = torch.ones(num_envs, dtype=torch.bool, device=self.device)
+        degraded_mask = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        target_min = self._curr_target_min
+        target_max = self._curr_target_max
         if self.cfg.use_ik_reachability:
             ee_pos_w = self._robot.data.body_pos_w[env_ids, self._tcp_body_idx]
             jacobian_pos = self._get_tcp_jacobian(env_ids)[:, :3, :]
@@ -272,31 +443,29 @@ class RlArmControllerEnv(DirectRLEnv):
                 is_valid = True
                 break
             if candidate is None or not is_valid:
-                valid_mask[i] = False
+                valid_mask[i] = True
+                degraded_mask[i] = True
                 center = ee_pos_local[i : i + 1]
                 offset = self._sample_uniform_pos(1, ((-1.0, 1.0), (-1.0, 1.0), (-1.0, 1.0)))[0]
                 offset = offset * self.cfg.invalid_target_fallback_radius
                 candidate = center.squeeze(0) + offset
-                target_min = torch.tensor(
-                    [self._curr_target_pos_range[0][0], self._curr_target_pos_range[1][0], self._curr_target_pos_range[2][0]],
-                    device=self.device,
-                )
-                target_max = torch.tensor(
-                    [self._curr_target_pos_range[0][1], self._curr_target_pos_range[1][1], self._curr_target_pos_range[2][1]],
-                    device=self.device,
-                )
                 candidate = torch.max(torch.min(candidate, target_max), target_min)
             target_pos[i] = candidate
         self._target_pos[env_ids] = target_pos
         self._update_target_markers()
-        return valid_mask
+        return valid_mask, degraded_mask
 
-    def _reset_obstacles(self, env_ids: torch.Tensor) -> torch.Tensor:
+    def _reset_obstacles(self, env_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # Obstacle sampling with distance constraints and optional LOS clearance.
+        if not torch.is_tensor(env_ids):
+            env_ids = torch.tensor(env_ids, device=self.device, dtype=torch.long)
         num_envs = len(env_ids)
         obstacle_pos = torch.zeros((num_envs, self.cfg.num_obstacles, 3), device=self.device)
         valid_mask = torch.ones(num_envs, dtype=torch.bool, device=self.device)
-        inactive_pos = torch.tensor(self.cfg.obstacle_inactive_pos, device=self.device)
+        degraded_mask = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        inactive_pos = self._obstacle_inactive_pos
         active_count = max(0, min(self._active_obstacle_count, self.cfg.num_obstacles))
+        tcp_pos = self._robot.data.body_pos_w[env_ids, self._tcp_body_idx] - self.scene.env_origins[env_ids]
         for env_idx in range(num_envs):
             target_pos = self._target_pos[env_ids[env_idx]]
             env_valid = True
@@ -311,13 +480,22 @@ class RlArmControllerEnv(DirectRLEnv):
                     env_valid = False
                     break
                 obstacle_pos[env_idx, obs_idx] = candidate
+            if env_valid and self.cfg.enable_los_clearance_check and active_count > 0:
+                if not self._is_line_of_sight_clear(tcp_pos[env_idx], target_pos, obstacle_pos[env_idx, :active_count]):
+                    env_valid = False
             if not env_valid:
-                valid_mask[env_idx] = False
+                valid_mask[env_idx] = True
+                degraded_mask[env_idx] = True
                 obstacle_pos[env_idx, :active_count] = inactive_pos
             if active_count < self.cfg.num_obstacles:
                 obstacle_pos[env_idx, active_count:] = inactive_pos
         self._obstacle_pos[env_ids] = obstacle_pos
 
+        self._write_obstacle_positions(env_ids, obstacle_pos)
+        return valid_mask, degraded_mask
+
+    def _write_obstacle_positions(self, env_ids: torch.Tensor, obstacle_pos: torch.Tensor) -> None:
+        # Write obstacle root poses and velocities in one place for reuse.
         for i, obstacle in enumerate(self._obstacles):
             root_state = obstacle.data.default_root_state[env_ids].clone()
             root_state[:, :3] = obstacle_pos[:, i, :] + self.scene.env_origins[env_ids]
@@ -325,13 +503,13 @@ class RlArmControllerEnv(DirectRLEnv):
             root_state[:, 7:] = 0.0
             obstacle.write_root_pose_to_sim(root_state[:, :7], env_ids)
             obstacle.write_root_velocity_to_sim(root_state[:, 7:], env_ids)
-        return valid_mask
 
     def _update_target_markers(self):
         target_pos_w = self._target_pos + self.scene.env_origins
         self._target_markers.visualize(translations=target_pos_w)
 
     def _check_obstacle_collision(self) -> torch.Tensor:
+        # Aggregate contact from obstacle contact sensors.
         if not self._obstacle_contact_sensors:
             return torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         contact_flags = []
@@ -351,6 +529,7 @@ class RlArmControllerEnv(DirectRLEnv):
         return 2.0 * (joint_pos - self._dof_lower_limits) / (self._dof_upper_limits - self._dof_lower_limits) - 1.0
 
     def _apply_curriculum_stage(self, stage_idx: int) -> None:
+        # Update sampling ranges and tolerances when curriculum advances.
         stage = self._curriculum_cfg.stages[stage_idx]
         self._curriculum_stage = stage_idx
         self._curr_target_pos_range = stage.target_pos_range
@@ -360,8 +539,27 @@ class RlArmControllerEnv(DirectRLEnv):
         else:
             self._curr_obstacle_pos_range = stage.obstacle_pos_range
         self._active_obstacle_count = max(0, min(stage.active_obstacles, self.cfg.num_obstacles))
+        self._update_target_bounds_tensors()
         self.extras["Stats/curriculum_stage"] = float(self._curriculum_stage)
         self.extras["Stats/curriculum_success_tolerance"] = float(self._curr_success_tolerance)
+
+    def _update_target_bounds_tensors(self) -> None:
+        self._curr_target_min = torch.tensor(
+            [
+                self._curr_target_pos_range[0][0],
+                self._curr_target_pos_range[1][0],
+                self._curr_target_pos_range[2][0],
+            ],
+            device=self.device,
+        )
+        self._curr_target_max = torch.tensor(
+            [
+                self._curr_target_pos_range[0][1],
+                self._curr_target_pos_range[1][1],
+                self._curr_target_pos_range[2][1],
+            ],
+            device=self.device,
+        )
 
     def _reset_success_history(self) -> None:
         self._episode_success_history.zero_()
@@ -370,6 +568,7 @@ class RlArmControllerEnv(DirectRLEnv):
         self._success_rate = 0.0
 
     def _update_success_history(self, env_ids: torch.Tensor) -> None:
+        # Track success history for curriculum gating.
         if self._episode_success_history.numel() == 0:
             return
         valid_env_ids = env_ids[~self._invalid_reset_buf[env_ids]]
@@ -458,6 +657,23 @@ class RlArmControllerEnv(DirectRLEnv):
         if dist_base > self.cfg.target_max_distance_from_base:
             return False
         return True
+
+    def _is_line_of_sight_clear(
+        self, tcp_pos: torch.Tensor, target_pos: torch.Tensor, obstacle_pos: torch.Tensor
+    ) -> bool:
+        # Segment-to-sphere distance test for cheap clearance checks.
+        if obstacle_pos.numel() == 0:
+            return True
+        direction = target_pos - tcp_pos
+        dir_norm_sq = torch.sum(direction * direction)
+        if dir_norm_sq.item() <= 1e-6:
+            return True
+        to_obs = obstacle_pos - tcp_pos
+        t = torch.sum(to_obs * direction, dim=-1) / dir_norm_sq
+        t = torch.clamp(t, 0.0, 1.0)
+        closest = tcp_pos + t.unsqueeze(-1) * direction
+        dist = torch.norm(obstacle_pos - closest, dim=-1)
+        return torch.all(dist > self._obstacle_clearance_radius).item()
 
     def _is_obstacle_valid(
         self, obstacle_pos: torch.Tensor, target_pos: torch.Tensor, existing_obstacles: torch.Tensor

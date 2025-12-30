@@ -6,11 +6,13 @@ import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg
 
+# Resolve asset path relative to repo root to keep config portable.
 _PROJECT_ROOT = Path(__file__).resolve().parents[6]
 _FANUC_USD_PATH = (_PROJECT_ROOT / "assets" / "Robots" / "FANUC" / "usd" / "fanuc200ic5l_sg2.usd").as_posix()
 
 
 FANUC_LRMATE_SG2_CFG = ArticulationCfg(
+    # Robot asset and physics properties.
     prim_path="/World/envs/env_.*/Robot",
     spawn=sim_utils.UsdFileCfg(
         usd_path=_FANUC_USD_PATH,
@@ -25,6 +27,7 @@ FANUC_LRMATE_SG2_CFG = ArticulationCfg(
             solver_velocity_iteration_count=1,
         ),
     ),
+    # Default pose and joint targets.
     init_state=ArticulationCfg.InitialStateCfg(
         pos=(0.0, 0.0, 0.0),
         rot=(1.0, 0.0, 0.0, 0.0),
@@ -38,6 +41,7 @@ FANUC_LRMATE_SG2_CFG = ArticulationCfg(
         },
         joint_vel={".*": 0.0},
     ),
+    # Joint-level actuation limits.
     actuators={
         "fanuc_arm": ImplicitActuatorCfg(
             joint_names_expr=["joint_[1-6]"],
