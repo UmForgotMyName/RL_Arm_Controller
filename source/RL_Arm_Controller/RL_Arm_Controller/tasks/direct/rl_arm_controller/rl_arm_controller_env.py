@@ -5,16 +5,16 @@
 
 from __future__ import annotations
 
-import torch
 from collections.abc import Sequence
 
+import torch
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs import DirectRLEnv
 from isaaclab.markers import VisualizationMarkers
 from isaaclab.sensors import ContactSensor
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-from isaaclab.utils.math import normalize, quat_apply, sample_uniform
+from isaaclab.utils.math import normalize, quat_apply, quat_mul, sample_uniform
 
 from .rl_arm_controller_env_cfg import RlArmControllerEnvCfg
 
@@ -53,6 +53,9 @@ class RlArmControllerEnv(DirectRLEnv):
         self._has_prev_dist = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._success_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._invalid_reset_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._collision_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._time_out_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._stuck_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._episode_stats_initialized = False
         self._invalid_reset_count = 0
         self._total_reset_count = 0
@@ -62,9 +65,7 @@ class RlArmControllerEnv(DirectRLEnv):
         self._repair_attempts_total = 0
         self._repair_attempts_count = 0
         self._invalid_reset_ema = 0.0
-        self._invalid_reset_window = torch.zeros(
-            self.cfg.invalid_fraction_window, dtype=torch.bool, device=self.device
-        )
+        self._invalid_reset_window = torch.zeros(self.cfg.invalid_fraction_window, dtype=torch.bool, device=self.device)
         self._invalid_reset_window_idx = 0
         self._invalid_reset_window_filled = 0
         self._degraded_target_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -72,9 +73,12 @@ class RlArmControllerEnv(DirectRLEnv):
         self._best_dist = torch.zeros(self.num_envs, device=self.device)
         self._stuck_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._stuck_terminated_count = 0
+        self._robot_contact_sensor: ContactSensor | None = None
 
         # ---- Geometry helpers ----
         self._tcp_forward_axis = torch.tensor(self.cfg.tcp_forward_axis, device=self.device).repeat(self.num_envs, 1)
+        self._tcp_offset_pos = torch.tensor(self.cfg.tcp_offset_pos, device=self.device).repeat(self.num_envs, 1)
+        self._tcp_offset_rot = torch.tensor(self.cfg.tcp_offset_rot, device=self.device).repeat(self.num_envs, 1)
         self._base_pos_local = torch.tensor(self.cfg.robot_cfg.init_state.pos, device=self.device)
         obstacle_diag = torch.tensor(self.cfg.obstacle_size, device=self.device)
         self._obstacle_clearance_radius = 0.5 * torch.linalg.norm(obstacle_diag) + self.cfg.los_clearance_margin
@@ -84,11 +88,7 @@ class RlArmControllerEnv(DirectRLEnv):
         self._target_markers = VisualizationMarkers(self.cfg.target_marker_cfg)
         # ---- Curriculum ----
         self._curriculum_cfg = self.cfg.curriculum
-        self._curriculum_enabled = (
-            self._curriculum_cfg is not None
-            and self._curriculum_cfg.enabled
-            and len(self._curriculum_cfg.stages) > 0
-        )
+        self._curriculum_enabled = self._curriculum_cfg is not None and self._curriculum_cfg.enabled and len(self._curriculum_cfg.stages) > 0
         self._curriculum_stage = 0
         self._curr_target_pos_range = self.cfg.target_pos_range
         self._curr_obstacle_pos_range = self.cfg.obstacle_pos_range
@@ -106,6 +106,10 @@ class RlArmControllerEnv(DirectRLEnv):
         self._reset_count_by_stage = [0 for _ in range(stage_count)]
         self._invalid_count_by_stage = [0 for _ in range(stage_count)]
         self._degraded_count_by_stage = [0 for _ in range(stage_count)]
+        self._success_count_by_stage = [0 for _ in range(stage_count)]
+        self._timeout_count_by_stage = [0 for _ in range(stage_count)]
+        self._stuck_count_by_stage = [0 for _ in range(stage_count)]
+        self._collision_count_by_stage = [0 for _ in range(stage_count)]
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot_cfg)
@@ -113,17 +117,15 @@ class RlArmControllerEnv(DirectRLEnv):
 
         # ---- Obstacles and contact sensors ----
         self._obstacles: list[RigidObject] = []
-        self._obstacle_contact_sensors: list[ContactSensor] = []
+        self._robot_contact_sensor = None
         for i in range(self.cfg.num_obstacles):
             obstacle_cfg = self.cfg.obstacle_cfg.replace(prim_path=f"/World/envs/env_.*/Obstacle_{i}")
             obstacle = RigidObject(obstacle_cfg)
             self._obstacles.append(obstacle)
             self.scene.rigid_objects[f"obstacle_{i}"] = obstacle
 
-            sensor_cfg = self.cfg.obstacle_contact_sensor.replace(prim_path=f"/World/envs/env_.*/Obstacle_{i}")
-            sensor = ContactSensor(sensor_cfg)
-            self._obstacle_contact_sensors.append(sensor)
-            self.scene.sensors[f"obstacle_contact_sensor_{i}"] = sensor
+        self._robot_contact_sensor = ContactSensor(self.cfg.robot_contact_sensor)
+        self.scene.sensors["robot_contact_sensor"] = self._robot_contact_sensor
 
         # ---- Static world ----
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
@@ -151,7 +153,7 @@ class RlArmControllerEnv(DirectRLEnv):
         joint_pos = self._robot.data.joint_pos[:, self._joint_ids]
         joint_vel = self._robot.data.joint_vel[:, self._joint_ids] * self.cfg.dof_velocity_scale
 
-        tcp_pos = self._robot.data.body_pos_w[:, self._tcp_body_idx] - self.scene.env_origins
+        tcp_pos, _ = self._get_tcp_pose()
         target_rel = self._target_pos - tcp_pos
 
         # ---- Assemble observation ----
@@ -173,7 +175,7 @@ class RlArmControllerEnv(DirectRLEnv):
 
     def _get_rewards(self) -> torch.Tensor:
         # ---- Distance and progress ----
-        tcp_pos = self._robot.data.body_pos_w[:, self._tcp_body_idx] - self.scene.env_origins
+        tcp_pos, tcp_quat = self._get_tcp_pose()
         to_target = self._target_pos - tcp_pos
         dist = torch.norm(to_target, dim=-1)
 
@@ -196,15 +198,17 @@ class RlArmControllerEnv(DirectRLEnv):
 
         # ---- Optional orientation shaping ----
         if self.cfg.rew_scale_approach != 0.0:
-            tcp_rot = self._robot.data.body_quat_w[:, self._tcp_body_idx]
-            tcp_forward = quat_apply(tcp_rot, self._tcp_forward_axis)
+            tcp_forward = quat_apply(tcp_quat, self._tcp_forward_axis)
             to_target_dir = normalize(to_target)
             reward += self.cfg.rew_scale_approach * torch.sum(tcp_forward * to_target_dir, dim=-1)
 
         # ---- Collision penalty ----
         if self.cfg.rew_scale_collision != 0.0:
             collision = self._check_obstacle_collision()
+            self._collision_buf.copy_(collision)
             reward = torch.where(collision, reward + self.cfg.rew_scale_collision, reward)
+        elif not self.cfg.terminate_on_collision:
+            self._collision_buf.zero_()
         reward = torch.where(self._invalid_reset_buf, torch.zeros_like(reward), reward)
 
         self._prev_dist = dist
@@ -214,7 +218,7 @@ class RlArmControllerEnv(DirectRLEnv):
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         # ---- Termination conditions ----
-        tcp_pos = self._robot.data.body_pos_w[:, self._tcp_body_idx] - self.scene.env_origins
+        tcp_pos, _ = self._get_tcp_pose()
         dist = torch.norm(self._target_pos - tcp_pos, dim=-1)
         success = dist < self._curr_success_tolerance
         self._success_buf = success
@@ -222,9 +226,13 @@ class RlArmControllerEnv(DirectRLEnv):
         terminated = success
         if self.cfg.terminate_on_collision:
             collision = self._check_obstacle_collision()
+            self._collision_buf.copy_(collision)
             terminated = terminated | collision
+        elif self.cfg.rew_scale_collision == 0.0:
+            self._collision_buf.zero_()
 
         time_out = self.episode_length_buf >= self.max_episode_length - 1
+        stuck = torch.zeros_like(time_out)
         if self.cfg.enable_stuck_termination:
             # Track progress and truncate if there is no improvement for a while.
             improved = dist < (self._best_dist - self.cfg.stuck_min_progress)
@@ -236,6 +244,11 @@ class RlArmControllerEnv(DirectRLEnv):
                 self._stuck_terminated_count += stuck.sum().item()
         self.extras["Stats/stuck_terminated_count"] = float(self._stuck_terminated_count)
         time_out = time_out | self._invalid_reset_buf
+        if self.cfg.enable_stuck_termination:
+            self._stuck_buf.copy_(stuck)
+        else:
+            self._stuck_buf.zero_()
+        self._time_out_buf.copy_(time_out)
         return terminated, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
@@ -245,7 +258,8 @@ class RlArmControllerEnv(DirectRLEnv):
         super()._reset_idx(env_ids)
         if not torch.is_tensor(env_ids):
             env_ids = torch.tensor(env_ids, device=self.device, dtype=torch.long)
-        if self._episode_stats_initialized:
+        has_prev_episode = self._episode_stats_initialized
+        if has_prev_episode:
             self._update_success_history(env_ids)
         else:
             self._episode_stats_initialized = True
@@ -255,9 +269,7 @@ class RlArmControllerEnv(DirectRLEnv):
 
         noise = sample_uniform(-1.0, 1.0, (len(env_ids), len(self._joint_ids)), device=self.device)
         joint_pos[:, self._joint_ids] = self._default_joint_pos[env_ids] + noise * self.cfg.reset_joint_pos_noise
-        joint_pos[:, self._joint_ids] = torch.clamp(
-            joint_pos[:, self._joint_ids], self._dof_lower_limits, self._dof_upper_limits
-        )
+        joint_pos[:, self._joint_ids] = torch.clamp(joint_pos[:, self._joint_ids], self._dof_lower_limits, self._dof_upper_limits)
         joint_vel[:, self._joint_ids] = 0.0
 
         self._default_joint_pos[env_ids] = joint_pos[:, self._joint_ids]
@@ -345,9 +357,7 @@ class RlArmControllerEnv(DirectRLEnv):
             self._invalid_reset_window_idx = (self._invalid_reset_window_idx + num) % window_size
             self._invalid_reset_window_filled = min(window_size, self._invalid_reset_window_filled + num)
             if self._invalid_reset_window_filled < window_size:
-                invalid_window_fraction = (
-                    self._invalid_reset_window[: self._invalid_reset_window_filled].float().mean().item()
-                )
+                invalid_window_fraction = self._invalid_reset_window[: self._invalid_reset_window_filled].float().mean().item()
             else:
                 invalid_window_fraction = self._invalid_reset_window.float().mean().item()
 
@@ -357,23 +367,28 @@ class RlArmControllerEnv(DirectRLEnv):
             self._reset_count_by_stage[stage_idx] += len(env_ids)
             self._invalid_count_by_stage[stage_idx] += raw_invalid_count
             self._degraded_count_by_stage[stage_idx] += degraded_count
+            if has_prev_episode:
+                self._success_count_by_stage[stage_idx] += self._success_buf[env_ids].sum().item()
+                self._timeout_count_by_stage[stage_idx] += self._time_out_buf[env_ids].sum().item()
+                self._stuck_count_by_stage[stage_idx] += self._stuck_buf[env_ids].sum().item()
+                self._collision_count_by_stage[stage_idx] += self._collision_buf[env_ids].sum().item()
             for idx in range(len(self._reset_count_by_stage)):
                 self.extras[f"Stats/reset_count_stage_{idx}"] = float(self._reset_count_by_stage[idx])
                 self.extras[f"Stats/invalid_count_stage_{idx}"] = float(self._invalid_count_by_stage[idx])
                 self.extras[f"Stats/degraded_count_stage_{idx}"] = float(self._degraded_count_by_stage[idx])
+                self.extras[f"Stats/success_count_stage_{idx}"] = float(self._success_count_by_stage[idx])
+                self.extras[f"Stats/timeout_count_stage_{idx}"] = float(self._timeout_count_by_stage[idx])
+                self.extras[f"Stats/stuck_count_stage_{idx}"] = float(self._stuck_count_by_stage[idx])
+                self.extras[f"Stats/collision_count_stage_{idx}"] = float(self._collision_count_by_stage[idx])
 
         self.extras["Stats/invalid_env_fraction"] = float(self._invalid_reset_ema)
         self.extras["Stats/invalid_env_fraction_window"] = float(invalid_window_fraction)
         self.extras["Stats/invalid_env_count"] = float(self._invalid_reset_count)
         self.extras["Stats/degraded_env_count"] = float(self._degraded_reset_count)
-        self.extras["Stats/degraded_env_fraction"] = float(
-            self._degraded_reset_count / max(1, self._total_reset_count)
-        )
+        self.extras["Stats/degraded_env_fraction"] = float(self._degraded_reset_count / max(1, self._total_reset_count))
         self.extras["Stats/degraded_target_count"] = float(self._degraded_target_count)
         self.extras["Stats/degraded_obstacle_count"] = float(self._degraded_obstacle_count)
-        self.extras["Stats/repair_attempts_used_avg"] = self._repair_attempts_total / max(
-            1, self._repair_attempts_count
-        )
+        self.extras["Stats/repair_attempts_used_avg"] = self._repair_attempts_total / max(1, self._repair_attempts_count)
         self.extras["Stats/reset_count"] = float(self._total_reset_count)
 
         # ---- Buffer resets for new episode ----
@@ -382,7 +397,7 @@ class RlArmControllerEnv(DirectRLEnv):
         self._prev_actions[env_ids] = 0.0
         self._prev_dist[env_ids] = 0.0
         self._has_prev_dist[env_ids] = False
-        tcp_pos = self._robot.data.body_pos_w[env_ids, self._tcp_body_idx] - self.scene.env_origins[env_ids]
+        tcp_pos, _ = self._get_tcp_pose(env_ids)
         self._best_dist[env_ids] = torch.norm(self._target_pos[env_ids] - tcp_pos, dim=-1)
         self._stuck_steps[env_ids] = 0
 
@@ -392,10 +407,8 @@ class RlArmControllerEnv(DirectRLEnv):
             env_ids = torch.tensor(env_ids, device=self.device, dtype=torch.long)
         if env_ids.numel() == 0:
             return
-        tcp_pos = self._robot.data.body_pos_w[env_ids, self._tcp_body_idx] - self.scene.env_origins[env_ids]
-        offset = self._sample_uniform_pos(
-            len(env_ids), ((-1.0, 1.0), (-1.0, 1.0), (-1.0, 1.0))
-        ) * self.cfg.invalid_target_fallback_radius
+        tcp_pos, _ = self._get_tcp_pose(env_ids)
+        offset = self._sample_uniform_pos(len(env_ids), ((-1.0, 1.0), (-1.0, 1.0), (-1.0, 1.0))) * self.cfg.invalid_target_fallback_radius
         target_pos = tcp_pos + offset
         target_pos = torch.max(torch.min(target_pos, self._curr_target_max), self._curr_target_min)
         self._target_pos[env_ids] = target_pos
@@ -417,13 +430,13 @@ class RlArmControllerEnv(DirectRLEnv):
         target_min = self._curr_target_min
         target_max = self._curr_target_max
         if self.cfg.use_ik_reachability:
-            ee_pos_w = self._robot.data.body_pos_w[env_ids, self._tcp_body_idx]
+            ee_pos_w, _ = self._get_tcp_pose_w(env_ids)
             jacobian_pos = self._get_tcp_jacobian(env_ids)[:, :3, :]
             joint_pos = self._robot.data.joint_pos[env_ids][:, self._joint_ids]
             env_origins = self.scene.env_origins[env_ids]
             ee_pos_local = ee_pos_w - env_origins
         else:
-            ee_pos_local = self._robot.data.body_pos_w[env_ids, self._tcp_body_idx] - self.scene.env_origins[env_ids]
+            ee_pos_local, _ = self._get_tcp_pose(env_ids)
         for i in range(num_envs):
             candidate = None
             is_valid = False
@@ -465,7 +478,7 @@ class RlArmControllerEnv(DirectRLEnv):
         degraded_mask = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
         inactive_pos = self._obstacle_inactive_pos
         active_count = max(0, min(self._active_obstacle_count, self.cfg.num_obstacles))
-        tcp_pos = self._robot.data.body_pos_w[env_ids, self._tcp_body_idx] - self.scene.env_origins[env_ids]
+        tcp_pos, _ = self._get_tcp_pose(env_ids)
         for env_idx in range(num_envs):
             target_pos = self._target_pos[env_ids[env_idx]]
             env_valid = True
@@ -508,22 +521,45 @@ class RlArmControllerEnv(DirectRLEnv):
         target_pos_w = self._target_pos + self.scene.env_origins
         self._target_markers.visualize(translations=target_pos_w)
 
+    def _get_tcp_pose_w(self, env_ids: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        if env_ids is None:
+            link_pos = self._robot.data.body_pos_w[:, self._tcp_body_idx]
+            link_quat = self._robot.data.body_quat_w[:, self._tcp_body_idx]
+            offset_pos = self._tcp_offset_pos
+            offset_rot = self._tcp_offset_rot
+        else:
+            link_pos = self._robot.data.body_pos_w[env_ids, self._tcp_body_idx]
+            link_quat = self._robot.data.body_quat_w[env_ids, self._tcp_body_idx]
+            offset_pos = self._tcp_offset_pos[env_ids]
+            offset_rot = self._tcp_offset_rot[env_ids]
+        tcp_pos = link_pos + quat_apply(link_quat, offset_pos)
+        tcp_quat = quat_mul(link_quat, offset_rot)
+        return tcp_pos, tcp_quat
+
+    def _get_tcp_pose(self, env_ids: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        tcp_pos_w, tcp_quat = self._get_tcp_pose_w(env_ids)
+        if env_ids is None:
+            env_origins = self.scene.env_origins
+        else:
+            env_origins = self.scene.env_origins[env_ids]
+        tcp_pos = tcp_pos_w - env_origins
+        return tcp_pos, tcp_quat
+
     def _check_obstacle_collision(self) -> torch.Tensor:
-        # Aggregate contact from obstacle contact sensors.
-        if not self._obstacle_contact_sensors:
+        # Aggregate contact from robot contact sensor.
+        if self._robot_contact_sensor is None:
             return torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        contact_flags = []
-        for sensor in self._obstacle_contact_sensors:
-            if sensor.cfg.filter_prim_paths_expr:
-                force_matrix = sensor.data.force_matrix_w
+        sensor = self._robot_contact_sensor
+        if sensor.cfg.filter_prim_paths_expr:
+            force_matrix = sensor.data.force_matrix_w
+            if force_matrix is not None:
                 contact = torch.norm(force_matrix, dim=-1) > self.cfg.collision_force_threshold
-                contact_any = torch.any(contact, dim=(1, 2))
-            else:
-                net_forces = sensor.data.net_forces_w
-                contact = torch.norm(net_forces, dim=-1) > self.cfg.collision_force_threshold
-                contact_any = torch.any(contact, dim=1)
-            contact_flags.append(contact_any)
-        return torch.any(torch.stack(contact_flags, dim=0), dim=0)
+                return torch.any(contact, dim=(1, 2))
+        net_forces = sensor.data.net_forces_w
+        if net_forces is None:
+            return torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        contact = torch.norm(net_forces, dim=-1) > self.cfg.collision_force_threshold
+        return torch.any(contact, dim=1)
 
     def _scale_joint_pos(self, joint_pos: torch.Tensor) -> torch.Tensor:
         return 2.0 * (joint_pos - self._dof_lower_limits) / (self._dof_upper_limits - self._dof_lower_limits) - 1.0
@@ -583,9 +619,7 @@ class RlArmControllerEnv(DirectRLEnv):
         self._episode_history_filled = min(window_size, self._episode_history_filled + num)
         if self._episode_history_filled > 0:
             if self._episode_history_filled < window_size:
-                self._success_rate = (
-                    self._episode_success_history[: self._episode_history_filled].mean().item()
-                )
+                self._success_rate = self._episode_success_history[: self._episode_history_filled].mean().item()
             else:
                 self._success_rate = self._episode_success_history.mean().item()
         else:
@@ -610,9 +644,7 @@ class RlArmControllerEnv(DirectRLEnv):
     def _compute_dls_delta(self, jacobian_pos: torch.Tensor, delta_pos: torch.Tensor) -> torch.Tensor:
         jacobian_t = torch.transpose(jacobian_pos, 1, 2)
         lambda_val = self.cfg.ik_reachability_dls_lambda
-        eye = torch.eye(jacobian_pos.shape[1], device=self.device).unsqueeze(0).expand(
-            jacobian_pos.shape[0], -1, -1
-        )
+        eye = torch.eye(jacobian_pos.shape[1], device=self.device).unsqueeze(0).expand(jacobian_pos.shape[0], -1, -1)
         mat = jacobian_pos @ jacobian_t + (lambda_val**2) * eye
         delta_q = jacobian_t @ torch.linalg.solve(mat, delta_pos.unsqueeze(-1))
         return delta_q.squeeze(-1)
@@ -658,9 +690,7 @@ class RlArmControllerEnv(DirectRLEnv):
             return False
         return True
 
-    def _is_line_of_sight_clear(
-        self, tcp_pos: torch.Tensor, target_pos: torch.Tensor, obstacle_pos: torch.Tensor
-    ) -> bool:
+    def _is_line_of_sight_clear(self, tcp_pos: torch.Tensor, target_pos: torch.Tensor, obstacle_pos: torch.Tensor) -> bool:
         # Segment-to-sphere distance test for cheap clearance checks.
         if obstacle_pos.numel() == 0:
             return True
@@ -675,9 +705,7 @@ class RlArmControllerEnv(DirectRLEnv):
         dist = torch.norm(obstacle_pos - closest, dim=-1)
         return torch.all(dist > self._obstacle_clearance_radius).item()
 
-    def _is_obstacle_valid(
-        self, obstacle_pos: torch.Tensor, target_pos: torch.Tensor, existing_obstacles: torch.Tensor
-    ) -> bool:
+    def _is_obstacle_valid(self, obstacle_pos: torch.Tensor, target_pos: torch.Tensor, existing_obstacles: torch.Tensor) -> bool:
         dist_base = torch.norm(obstacle_pos - self._base_pos_local)
         if dist_base < self.cfg.obstacle_min_distance_from_base:
             return False

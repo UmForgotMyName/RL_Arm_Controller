@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, RigidObjectCfg
 from isaaclab.envs import DirectRLEnvCfg
@@ -19,9 +21,9 @@ from .fanuc_cfg import FANUC_LRMATE_SG2_CFG
 
 @configclass
 class CurriculumStageCfg:
-    target_pos_range: tuple[tuple[float, float], tuple[float, float], tuple[float, float]]
-    success_tolerance: float
-    active_obstacles: int
+    target_pos_range: tuple[tuple[float, float], tuple[float, float], tuple[float, float]] = dataclasses.MISSING
+    success_tolerance: float = dataclasses.MISSING
+    active_obstacles: int = dataclasses.MISSING
     obstacle_pos_range: tuple[tuple[float, float], tuple[float, float], tuple[float, float]] | None = None
 
 
@@ -73,14 +75,14 @@ class RlArmControllerEnvCfg(DirectRLEnvCfg):
     # ---- Robot ----
     robot_cfg: ArticulationCfg = FANUC_LRMATE_SG2_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     joint_names = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"]
-    tcp_body_name = "tcp"
+    tcp_body_name = "link_6"
     tcp_prim_path = "/lrmate200ic5l_with_sg2/link_6/flange/tool0/sg2/tcp"
     tcp_forward_axis = (0.0, 0.0, 1.0)
+    tcp_offset_pos = (0.200745, 0.040901, 0.038715)
+    tcp_offset_rot = (0.143792, -0.536639, -0.215200, -0.803138)
 
     # ---- Scene ----
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=1024, env_spacing=4.0, replicate_physics=True, clone_in_fabric=True
-    )
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=16, env_spacing=4.0, replicate_physics=True, clone_in_fabric=False)
 
     # ---- Targets ----
     target_pos_range = ((0.35, 0.65), (-0.35, 0.35), (0.2, 0.6))
@@ -128,12 +130,12 @@ class RlArmControllerEnvCfg(DirectRLEnvCfg):
         ),
         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.5, 0.0, 0.3), rot=(1.0, 0.0, 0.0, 0.0)),
     )
-    obstacle_contact_sensor: ContactSensorCfg = ContactSensorCfg(
-        prim_path="/World/envs/env_.*/Obstacle_0",
+    robot_contact_sensor: ContactSensorCfg = ContactSensorCfg(
+        prim_path="/World/envs/env_.*/Robot/(base_link|link_1|link_2|link_3|link_4|link_5|link_6)",
         update_period=0.0,
         history_length=0,
         force_threshold=1.0,
-        filter_prim_paths_expr=["/World/envs/env_.*/Robot/.*"],
+        filter_prim_paths_expr=[],
     )
 
     # ---- Control ----
@@ -173,4 +175,4 @@ class RlArmControllerEnvCfg(DirectRLEnvCfg):
             obs_dim += len(self.joint_names)
         self.observation_space = obs_dim
         self.action_space = len(self.joint_names)
-        self.obstacle_contact_sensor.force_threshold = self.collision_force_threshold
+        self.robot_contact_sensor.force_threshold = self.collision_force_threshold
