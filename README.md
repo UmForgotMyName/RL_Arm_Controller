@@ -170,6 +170,8 @@ python scripts/rsl_rl/train.py --task Isaac-Reach-Fanuc-v0 --headless
 C:\repos\IsaacLab\isaaclab.bat -p scripts\rsl_rl\train.py --task Isaac-Reach-Fanuc-v0 --headless
 ```
 
+python scripts/rsl_rl/play.py --task Isaac-Reach-Fanuc-v0 --num_envs 32 --checkpoint logs/rsl_rl/reach_fanuc/2025-12-31_19-58-01/model_499.pt
+
 ---
 
 ## ✅ Verify your setup

@@ -25,30 +25,51 @@ class CurriculumStageCfg:
     success_tolerance: float = dataclasses.MISSING
     active_obstacles: int = dataclasses.MISSING
     obstacle_pos_range: tuple[tuple[float, float], tuple[float, float], tuple[float, float]] | None = None
+    min_success_rate: float | None = None
+    window_size: int | None = None
+    use_ik_reachability: bool | None = None
+    enable_los_clearance_check: bool | None = None
+    los_clearance_margin: float | None = None
+    force_path_obstacle: bool | None = None
 
 
 @configclass
 class SuccessRateCurriculumCfg:
     enabled = True
-    window_size = 200
-    min_success_rate = 0.7
+    window_size = 100
+    min_success_rate = 0.4
     stages = [
         CurriculumStageCfg(
             target_pos_range=((0.4, 0.6), (-0.2, 0.2), (0.25, 0.45)),
-            success_tolerance=0.05,
+            success_tolerance=0.06,
             active_obstacles=0,
+            min_success_rate=0.4,
+            window_size=80,
+            use_ik_reachability=True,
+            enable_los_clearance_check=True,
+            force_path_obstacle=False,
         ),
         CurriculumStageCfg(
             target_pos_range=((0.35, 0.65), (-0.3, 0.3), (0.2, 0.55)),
             success_tolerance=0.04,
             active_obstacles=1,
             obstacle_pos_range=((0.3, 0.55), (-0.25, 0.25), (0.2, 0.5)),
+            min_success_rate=0.5,
+            window_size=120,
+            use_ik_reachability=True,
+            enable_los_clearance_check=True,
+            force_path_obstacle=False,
         ),
         CurriculumStageCfg(
             target_pos_range=((0.35, 0.65), (-0.35, 0.35), (0.2, 0.6)),
             success_tolerance=0.03,
             active_obstacles=2,
             obstacle_pos_range=((0.25, 0.6), (-0.3, 0.3), (0.15, 0.55)),
+            min_success_rate=0.7,
+            window_size=200,
+            use_ik_reachability=True,
+            enable_los_clearance_check=False,
+            force_path_obstacle=True,
         ),
     ]
 
@@ -57,7 +78,7 @@ class SuccessRateCurriculumCfg:
 class RlArmControllerEnvCfg(DirectRLEnvCfg):
     # ---- Env ----
     decimation = 2
-    episode_length_s = 6.0
+    episode_length_s = 8.0
     action_space = 6
     observation_space = 0
     state_space = 0
@@ -66,6 +87,7 @@ class RlArmControllerEnvCfg(DirectRLEnvCfg):
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 120,
         render_interval=decimation,
+        gravity=(0.0, 0.0, 0.0),
         physics_material=sim_utils.RigidBodyMaterialCfg(
             static_friction=1.0,
             dynamic_friction=1.0,
@@ -82,7 +104,7 @@ class RlArmControllerEnvCfg(DirectRLEnvCfg):
     tcp_offset_rot = (0.143792, -0.536639, -0.215200, -0.803138)
 
     # ---- Scene ----
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=16, env_spacing=4.0, replicate_physics=True, clone_in_fabric=False)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=128, env_spacing=4.0, replicate_physics=True, clone_in_fabric=False)
 
     # ---- Targets ----
     target_pos_range = ((0.35, 0.65), (-0.35, 0.35), (0.2, 0.6))
@@ -91,10 +113,10 @@ class RlArmControllerEnvCfg(DirectRLEnvCfg):
     target_resample_attempts = 30
     reset_repair_attempts = 3
     use_ik_reachability = True
-    ik_reachability_iters = 8
-    ik_reachability_tolerance = 0.02
+    ik_reachability_iters = 16
+    ik_reachability_tolerance = 0.03
     ik_reachability_dls_lambda = 0.02
-    ik_reachability_max_delta = 0.15
+    ik_reachability_max_delta = 0.25
     target_marker_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
         prim_path="/Visuals/target_marker",
         markers={
@@ -116,6 +138,9 @@ class RlArmControllerEnvCfg(DirectRLEnvCfg):
     obstacle_inactive_pos = (0.0, 0.0, 10.0)
     enable_los_clearance_check = True
     los_clearance_margin = 0.02
+    force_path_obstacle = False
+    path_obstacle_t_range = (0.2, 0.8)
+    path_obstacle_offset_range = (0.03, 0.08)
     obstacle_cfg: RigidObjectCfg = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Obstacle_0",
         spawn=sim_utils.CuboidCfg(
@@ -139,7 +164,7 @@ class RlArmControllerEnvCfg(DirectRLEnvCfg):
     )
 
     # ---- Control ----
-    action_scale = 0.5
+    action_scale = 0.10
     reset_joint_pos_noise = 0.05
     dof_velocity_scale = 0.1
     include_obstacle_obs = True
@@ -147,17 +172,21 @@ class RlArmControllerEnvCfg(DirectRLEnvCfg):
     obs_clip = 5.0
 
     # ---- Rewards ----
-    rew_scale_dist = 1.0
-    rew_scale_success = 5.0
+    rew_scale_dist = 0.1
+    rew_scale_success = 100.0
+    rew_scale_success_time = 50.0
     rew_scale_action = -0.01
     rew_scale_joint_vel = -0.005
-    rew_scale_collision = -5.0
-    rew_scale_progress = 0.5
+    rew_scale_collision = -10.0
+    rew_scale_progress = 1.0
     rew_scale_action_rate = -0.01
     rew_scale_approach = 0.0
+    rew_scale_proximity = 1.0
+    proximity_radius = 0.15
     success_tolerance = 0.03
-    terminate_on_collision = False
+    terminate_on_collision = True
     collision_force_threshold = 1.0
+    collision_penalty_once = True
     invalid_target_fallback_radius = 0.05
     enable_stuck_termination = False
     stuck_min_progress = 0.005

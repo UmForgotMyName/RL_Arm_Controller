@@ -16,9 +16,9 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     experiment_name = "reach_fanuc"
     run_name = ""
     policy = RslRlPpoActorCriticCfg(
-        init_noise_std=1.0,
-        actor_obs_normalization=False,
-        critic_obs_normalization=False,
+        init_noise_std=0.5,
+        actor_obs_normalization=True,
+        critic_obs_normalization=True,
         actor_hidden_dims=[128, 128],
         critic_hidden_dims=[128, 128],
         activation="elu",
@@ -31,7 +31,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         num_learning_epochs=8,
         num_mini_batches=4,
         learning_rate=5.0e-4,
-        schedule="adaptive",
+        schedule="fixed",
         gamma=0.99,
         lam=0.95,
         desired_kl=0.01,

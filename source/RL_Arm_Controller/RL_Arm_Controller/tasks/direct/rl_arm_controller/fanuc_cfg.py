@@ -22,7 +22,7 @@ FANUC_LRMATE_SG2_CFG = ArticulationCfg(
             max_depenetration_velocity=5.0,
         ),
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-            enabled_self_collisions=False,
+            enabled_self_collisions=True,
             solver_position_iteration_count=12,
             solver_velocity_iteration_count=1,
         ),
