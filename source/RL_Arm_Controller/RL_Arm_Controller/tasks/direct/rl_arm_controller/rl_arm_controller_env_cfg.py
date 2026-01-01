@@ -45,7 +45,7 @@ class SuccessRateCurriculumCfg:
             active_obstacles=0,
             min_success_rate=0.4,
             window_size=80,
-            use_ik_reachability=True,
+            use_ik_reachability=False,
             enable_los_clearance_check=True,
             force_path_obstacle=False,
         ),
@@ -56,7 +56,7 @@ class SuccessRateCurriculumCfg:
             obstacle_pos_range=((0.3, 0.55), (-0.25, 0.25), (0.2, 0.5)),
             min_success_rate=0.5,
             window_size=120,
-            use_ik_reachability=True,
+            use_ik_reachability=False,
             enable_los_clearance_check=True,
             force_path_obstacle=False,
         ),
@@ -108,9 +108,9 @@ class RlArmControllerEnvCfg(DirectRLEnvCfg):
 
     # ---- Targets ----
     target_pos_range = ((0.35, 0.65), (-0.35, 0.35), (0.2, 0.6))
-    target_min_distance_from_base = 0.2
-    target_max_distance_from_base = 0.9
-    target_resample_attempts = 30
+    target_min_distance_from_base = 0.1
+    target_max_distance_from_base = 1.1
+    target_resample_attempts = 60
     reset_repair_attempts = 3
     use_ik_reachability = True
     ik_reachability_iters = 16
@@ -193,6 +193,7 @@ class RlArmControllerEnvCfg(DirectRLEnvCfg):
     stuck_steps = 60
     invalid_fraction_ema_alpha = 0.05
     invalid_fraction_window = 200
+    stats_log_interval = 8
     # ---- Curriculum ----
     curriculum: SuccessRateCurriculumCfg = SuccessRateCurriculumCfg()
 

@@ -65,30 +65,20 @@ class RlArmControllerEnv(DirectRLEnv):
         self._degraded_target_count = 0
         self._degraded_obstacle_count = 0
         self._exclude_from_curriculum_count = 0
-        self._target_sample_invalid_distance_total = 0
-        self._target_sample_unreachable_total = 0
-        self._target_sample_success_total = 0
-        self._target_sample_attempts_total = 0
-        self._target_sample_attempts_count = 0
-        self._target_sample_invalid_distance_batch = 0
-        self._target_sample_unreachable_batch = 0
-        self._target_sample_success_batch = 0
-        self._target_sample_attempts_batch = 0
-        self._target_sample_attempts_batch_count = 0
         self._repair_attempts_total = 0
         self._repair_attempts_count = 0
         self._invalid_reset_ema = 0.0
-        self._invalid_reset_window = torch.zeros(self.cfg.invalid_fraction_window, dtype=torch.bool, device=self.device)
-        self._invalid_reset_window_idx = 0
-        self._invalid_reset_window_filled = 0
-        self._degraded_target_window = torch.zeros(self.cfg.invalid_fraction_window, dtype=torch.bool, device=self.device)
-        self._degraded_obstacle_window = torch.zeros(self.cfg.invalid_fraction_window, dtype=torch.bool, device=self.device)
-        self._exclude_from_curriculum_window = torch.zeros(self.cfg.invalid_fraction_window, dtype=torch.bool, device=self.device)
+        self._degraded_target_ema = 0.0
+        self._degraded_obstacle_ema = 0.0
+        self._exclude_from_curriculum_ema = 0.0
         self._degraded_target_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._degraded_obstacle_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._best_dist = torch.zeros(self.num_envs, device=self.device)
         self._stuck_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._stuck_terminated_count = 0
+        self._collision_count_total = 0
+        self._stats_log_interval = max(1, int(self.cfg.stats_log_interval))
+        self._stats_log_accum = 0
 
         # ---- Geometry helpers ----
         self._tcp_forward_axis = torch.tensor(self.cfg.tcp_forward_axis, device=self.device).repeat(self.num_envs, 1)
@@ -122,33 +112,13 @@ class RlArmControllerEnv(DirectRLEnv):
             self._update_target_bounds_tensors()
             self._update_obstacle_bounds_tensors()
         self._reset_success_history(self._curriculum_window_size)
-        stage_count = len(self._curriculum_cfg.stages) if self._curriculum_cfg is not None else 0
-        self._reset_count_by_stage = [0 for _ in range(stage_count)]
-        self._invalid_count_by_stage = [0 for _ in range(stage_count)]
-        self._degraded_count_by_stage = [0 for _ in range(stage_count)]
-        self._exclude_count_by_stage = [0 for _ in range(stage_count)]
-        self._success_count_by_stage = [0 for _ in range(stage_count)]
-        self._timeout_count_by_stage = [0 for _ in range(stage_count)]
-        self._stuck_count_by_stage = [0 for _ in range(stage_count)]
-        self._collision_count_by_stage = [0 for _ in range(stage_count)]
-        self._last_total_reset_count = 0
-        self._last_invalid_reset_count = 0
-        self._last_degraded_reset_count = 0
-        self._last_degraded_target_count = 0
-        self._last_degraded_obstacle_count = 0
-        self._last_exclude_from_curriculum_count = 0
-        self._last_target_sample_invalid_distance_total = 0
-        self._last_target_sample_unreachable_total = 0
-        self._last_target_sample_success_total = 0
-        self._last_target_sample_attempts_total = 0
-        self._last_reset_count_by_stage = [0 for _ in range(stage_count)]
-        self._last_invalid_count_by_stage = [0 for _ in range(stage_count)]
-        self._last_degraded_count_by_stage = [0 for _ in range(stage_count)]
-        self._last_exclude_count_by_stage = [0 for _ in range(stage_count)]
-        self._last_success_count_by_stage = [0 for _ in range(stage_count)]
-        self._last_timeout_count_by_stage = [0 for _ in range(stage_count)]
-        self._last_stuck_count_by_stage = [0 for _ in range(stage_count)]
-        self._last_collision_count_by_stage = [0 for _ in range(stage_count)]
+        self._last_logged_reset_count = 0
+        self._last_logged_invalid_reset_count = 0
+        self._last_logged_degraded_reset_count = 0
+        self._last_logged_degraded_target_count = 0
+        self._last_logged_degraded_obstacle_count = 0
+        self._last_logged_exclude_from_curriculum_count = 0
+        self._last_logged_collision_count = 0
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot_cfg)
@@ -218,9 +188,6 @@ class RlArmControllerEnv(DirectRLEnv):
         tcp_pos, tcp_quat = self._get_tcp_pose()
         to_target = self._target_pos - tcp_pos
         dist = torch.norm(to_target, dim=-1)
-        self.extras["Stats/mean_dist_to_target"] = float(dist.mean().item())
-        self.extras["Stats/min_dist_to_target"] = float(dist.min().item())
-
         reward = -self.cfg.rew_scale_dist * dist
         success = dist < self._curr_success_tolerance
         if self.cfg.rew_scale_success_time != 0.0:
@@ -307,7 +274,6 @@ class RlArmControllerEnv(DirectRLEnv):
             time_out = time_out | stuck
             if stuck.any():
                 self._stuck_terminated_count += stuck.sum().item()
-        self.extras["Stats/stuck_terminated_count"] = float(self._stuck_terminated_count)
         time_out = time_out | self._invalid_reset_buf
         if self.cfg.enable_stuck_termination:
             self._stuck_buf.copy_(stuck)
@@ -323,18 +289,15 @@ class RlArmControllerEnv(DirectRLEnv):
         super()._reset_idx(env_ids)
         if not torch.is_tensor(env_ids):
             env_ids = torch.tensor(env_ids, device=self.device, dtype=torch.long)
+        self._stats_log_accum += len(env_ids)
+        log_this_reset = self._stats_log_accum >= self._stats_log_interval
+        if log_this_reset:
+            self._stats_log_accum = self._stats_log_accum % self._stats_log_interval
         has_prev_episode = self._episode_stats_initialized
         if has_prev_episode:
             self._update_success_history(env_ids)
         else:
             self._episode_stats_initialized = True
-        prev_invalid_mask = self._invalid_reset_buf[env_ids].clone()
-        prev_exclude_mask = self._exclude_from_curriculum_buf[env_ids].clone()
-        self._target_sample_invalid_distance_batch = 0
-        self._target_sample_unreachable_batch = 0
-        self._target_sample_success_batch = 0
-        self._target_sample_attempts_batch = 0
-        self._target_sample_attempts_batch_count = 0
 
         joint_pos = self._robot.data.default_joint_pos[env_ids].clone()
         joint_vel = self._robot.data.default_joint_vel[env_ids].clone()
@@ -415,230 +378,63 @@ class RlArmControllerEnv(DirectRLEnv):
         self._degraded_target_count += degraded_target_count
         self._degraded_obstacle_count += degraded_obstacle_count
         self._exclude_from_curriculum_count += exclude_count
+        if has_prev_episode:
+            self._collision_count_total += self._collision_buf[env_ids].sum().item()
 
         used_mask = attempts_used > 0
         if used_mask.any():
             self._repair_attempts_total += attempts_used[used_mask].sum().item()
             self._repair_attempts_count += used_mask.sum().item()
 
-        # ---- Invalid stats: EMA + rolling window ----
-        invalid_fraction_batch = raw_invalid_count / max(1, len(env_ids))
+        # ---- Invalid stats: EMA ----
+        batch_den = max(1, len(env_ids))
+        invalid_fraction_batch = raw_invalid_count / batch_den
+        degraded_target_fraction_batch = degraded_target_count / batch_den
+        degraded_obstacle_fraction_batch = degraded_obstacle_count / batch_den
+        exclude_fraction_batch = exclude_count / batch_den
         alpha = self.cfg.invalid_fraction_ema_alpha
         if alpha > 0.0:
             self._invalid_reset_ema = (1.0 - alpha) * self._invalid_reset_ema + alpha * invalid_fraction_batch
+            self._degraded_target_ema = (1.0 - alpha) * self._degraded_target_ema + alpha * degraded_target_fraction_batch
+            self._degraded_obstacle_ema = (1.0 - alpha) * self._degraded_obstacle_ema + alpha * degraded_obstacle_fraction_batch
+            self._exclude_from_curriculum_ema = (1.0 - alpha) * self._exclude_from_curriculum_ema + alpha * exclude_fraction_batch
+        if log_this_reset:
+            reset_count_delta = self._total_reset_count - self._last_logged_reset_count
+            invalid_count_delta = self._invalid_reset_count - self._last_logged_invalid_reset_count
+            degraded_count_delta = self._degraded_reset_count - self._last_logged_degraded_reset_count
+            degraded_target_delta = self._degraded_target_count - self._last_logged_degraded_target_count
+            degraded_obstacle_delta = self._degraded_obstacle_count - self._last_logged_degraded_obstacle_count
+            exclude_count_delta = self._exclude_from_curriculum_count - self._last_logged_exclude_from_curriculum_count
+            collision_count_delta = self._collision_count_total - self._last_logged_collision_count
 
-        invalid_window_fraction = 0.0
-        degraded_target_window_fraction = 0.0
-        degraded_obstacle_window_fraction = 0.0
-        exclude_window_fraction = 0.0
-        window_size = self._invalid_reset_window.numel()
-        if window_size > 0:
-            num = len(env_ids)
-            idxs = (torch.arange(num, device=self.device) + self._invalid_reset_window_idx) % window_size
-            self._invalid_reset_window[idxs] = initial_invalid_mask
-            self._degraded_target_window[idxs] = target_degraded
-            self._degraded_obstacle_window[idxs] = obstacle_degraded
-            self._exclude_from_curriculum_window[idxs] = exclude_mask
-            self._invalid_reset_window_idx = (self._invalid_reset_window_idx + num) % window_size
-            self._invalid_reset_window_filled = min(window_size, self._invalid_reset_window_filled + num)
-            filled = self._invalid_reset_window_filled
-            if filled < window_size:
-                invalid_window_fraction = self._invalid_reset_window[:filled].float().mean().item()
-                degraded_target_window_fraction = self._degraded_target_window[:filled].float().mean().item()
-                degraded_obstacle_window_fraction = self._degraded_obstacle_window[:filled].float().mean().item()
-                exclude_window_fraction = self._exclude_from_curriculum_window[:filled].float().mean().item()
-            else:
-                invalid_window_fraction = self._invalid_reset_window.float().mean().item()
-                degraded_target_window_fraction = self._degraded_target_window.float().mean().item()
-                degraded_obstacle_window_fraction = self._degraded_obstacle_window.float().mean().item()
-                exclude_window_fraction = self._exclude_from_curriculum_window.float().mean().item()
+            self._last_logged_reset_count = self._total_reset_count
+            self._last_logged_invalid_reset_count = self._invalid_reset_count
+            self._last_logged_degraded_reset_count = self._degraded_reset_count
+            self._last_logged_degraded_target_count = self._degraded_target_count
+            self._last_logged_degraded_obstacle_count = self._degraded_obstacle_count
+            self._last_logged_exclude_from_curriculum_count = self._exclude_from_curriculum_count
+            self._last_logged_collision_count = self._collision_count_total
 
-        # ---- Per-stage counters (curriculum) ----
-        if self._reset_count_by_stage:
-            stage_idx = self._curriculum_stage
-            self._reset_count_by_stage[stage_idx] += len(env_ids)
-            self._invalid_count_by_stage[stage_idx] += raw_invalid_count
-            self._degraded_count_by_stage[stage_idx] += degraded_count
-            self._exclude_count_by_stage[stage_idx] += exclude_count
-            if has_prev_episode:
-                prev_valid_mask = ~(prev_invalid_mask | prev_exclude_mask)
-                self._success_count_by_stage[stage_idx] += self._success_buf[env_ids][prev_valid_mask].sum().item()
-                self._timeout_count_by_stage[stage_idx] += self._time_out_buf[env_ids].sum().item()
-                self._stuck_count_by_stage[stage_idx] += self._stuck_buf[env_ids].sum().item()
-                self._collision_count_by_stage[stage_idx] += self._collision_buf[env_ids].sum().item()
-        # ---- Counter deltas ----
-        reset_count_delta = self._total_reset_count - self._last_total_reset_count
-        invalid_count_delta = self._invalid_reset_count - self._last_invalid_reset_count
-        degraded_count_delta = self._degraded_reset_count - self._last_degraded_reset_count
-        degraded_target_delta = self._degraded_target_count - self._last_degraded_target_count
-        degraded_obstacle_delta = self._degraded_obstacle_count - self._last_degraded_obstacle_count
-        exclude_count_delta = self._exclude_from_curriculum_count - self._last_exclude_from_curriculum_count
-        target_invalid_distance_delta = (
-            self._target_sample_invalid_distance_total - self._last_target_sample_invalid_distance_total
-        )
-        target_unreachable_delta = self._target_sample_unreachable_total - self._last_target_sample_unreachable_total
-        target_success_delta = self._target_sample_success_total - self._last_target_sample_success_total
-        target_attempts_delta = self._target_sample_attempts_total - self._last_target_sample_attempts_total
+            self.extras["Stats/curriculum_stage"] = float(self._curriculum_stage)
+            self.extras["Stats/success_rate_valid"] = float(self._success_rate)
+            self.extras["Stats/success_rate_all"] = float(self._success_rate_all)
+            self.extras["Stats/invalid_env_fraction"] = float(self._invalid_reset_ema)
+            self.extras["Stats/degraded_target_fraction"] = float(self._degraded_target_ema)
+            self.extras["Stats/degraded_obstacle_fraction"] = float(self._degraded_obstacle_ema)
+            self.extras["Stats/exclude_from_curriculum_fraction"] = float(self._exclude_from_curriculum_ema)
+            self.extras["Stats/repair_attempts_used_avg"] = self._repair_attempts_total / max(1, self._repair_attempts_count)
+            self.extras["Stats/collision_fraction"] = collision_count_delta / max(1, reset_count_delta)
 
-        self._last_total_reset_count = self._total_reset_count
-        self._last_invalid_reset_count = self._invalid_reset_count
-        self._last_degraded_reset_count = self._degraded_reset_count
-        self._last_degraded_target_count = self._degraded_target_count
-        self._last_degraded_obstacle_count = self._degraded_obstacle_count
-        self._last_exclude_from_curriculum_count = self._exclude_from_curriculum_count
-        self._last_target_sample_invalid_distance_total = self._target_sample_invalid_distance_total
-        self._last_target_sample_unreachable_total = self._target_sample_unreachable_total
-        self._last_target_sample_success_total = self._target_sample_success_total
-        self._last_target_sample_attempts_total = self._target_sample_attempts_total
-
-        target_attempts_avg = self._target_sample_attempts_batch / max(1, self._target_sample_attempts_batch_count)
-
-        # ---- Rolling fractions and rates ----
-        self.extras["Stats/success_rate_valid"] = float(self._success_rate)
-        self.extras["Stats/success_rate_all"] = float(self._success_rate_all)
-        self.extras["Stats/invalid_env_fraction"] = float(self._invalid_reset_ema)
-        self.extras["Stats/invalid_env_fraction_window"] = float(invalid_window_fraction)
-        self.extras["Stats/degraded_target_fraction_recent"] = float(degraded_target_window_fraction)
-        self.extras["Stats/degraded_obstacle_fraction_recent"] = float(degraded_obstacle_window_fraction)
-        self.extras["Stats/exclude_from_curriculum_fraction_recent"] = float(exclude_window_fraction)
-        self.extras["Stats/degraded_env_fraction"] = float(self._degraded_reset_count / max(1, self._total_reset_count))
-        self.extras["Stats/repair_attempts_used_avg"] = self._repair_attempts_total / max(1, self._repair_attempts_count)
-        self.extras["Stats/target_sample_attempts_avg"] = float(target_attempts_avg)
-
-        # ---- Totals ----
-        self.extras["StatsTotals/reset_count"] = float(self._total_reset_count)
-        self.extras["StatsTotals/invalid_env_count"] = float(self._invalid_reset_count)
-        self.extras["StatsTotals/degraded_env_count"] = float(self._degraded_reset_count)
-        self.extras["StatsTotals/degraded_target_count"] = float(self._degraded_target_count)
-        self.extras["StatsTotals/degraded_obstacle_count"] = float(self._degraded_obstacle_count)
-        self.extras["StatsTotals/exclude_from_curriculum_count"] = float(self._exclude_from_curriculum_count)
-        self.extras["StatsTotals/target_sample_invalid_distance"] = float(self._target_sample_invalid_distance_total)
-        self.extras["StatsTotals/target_sample_unreachable"] = float(self._target_sample_unreachable_total)
-        self.extras["StatsTotals/target_sample_success"] = float(self._target_sample_success_total)
-        self.extras["StatsTotals/target_sample_attempts"] = float(self._target_sample_attempts_total)
-
-        # ---- Deltas ----
-        self.extras["StatsDelta/reset_count"] = float(reset_count_delta)
-        self.extras["StatsDelta/invalid_env_count"] = float(invalid_count_delta)
-        self.extras["StatsDelta/degraded_env_count"] = float(degraded_count_delta)
-        self.extras["StatsDelta/degraded_target_count"] = float(degraded_target_delta)
-        self.extras["StatsDelta/degraded_obstacle_count"] = float(degraded_obstacle_delta)
-        self.extras["StatsDelta/exclude_from_curriculum_count"] = float(exclude_count_delta)
-        self.extras["StatsDelta/target_sample_invalid_distance"] = float(target_invalid_distance_delta)
-        self.extras["StatsDelta/target_sample_unreachable"] = float(target_unreachable_delta)
-        self.extras["StatsDelta/target_sample_success"] = float(target_success_delta)
-        self.extras["StatsDelta/target_sample_attempts"] = float(target_attempts_delta)
-
-        # ---- Per-stage totals/deltas ----
-        stage_reset_deltas = []
-        stage_invalid_deltas = []
-        stage_degraded_deltas = []
-        stage_exclude_deltas = []
-        stage_success_deltas = []
-        stage_timeout_deltas = []
-        stage_stuck_deltas = []
-        stage_collision_deltas = []
-        for idx in range(len(self._reset_count_by_stage)):
-            reset_delta = self._reset_count_by_stage[idx] - self._last_reset_count_by_stage[idx]
-            invalid_delta = self._invalid_count_by_stage[idx] - self._last_invalid_count_by_stage[idx]
-            degraded_delta = self._degraded_count_by_stage[idx] - self._last_degraded_count_by_stage[idx]
-            exclude_delta = self._exclude_count_by_stage[idx] - self._last_exclude_count_by_stage[idx]
-            success_delta = self._success_count_by_stage[idx] - self._last_success_count_by_stage[idx]
-            timeout_delta = self._timeout_count_by_stage[idx] - self._last_timeout_count_by_stage[idx]
-            stuck_delta = self._stuck_count_by_stage[idx] - self._last_stuck_count_by_stage[idx]
-            collision_delta = self._collision_count_by_stage[idx] - self._last_collision_count_by_stage[idx]
-
-            stage_reset_deltas.append(reset_delta)
-            stage_invalid_deltas.append(invalid_delta)
-            stage_degraded_deltas.append(degraded_delta)
-            stage_exclude_deltas.append(exclude_delta)
-            stage_success_deltas.append(success_delta)
-            stage_timeout_deltas.append(timeout_delta)
-            stage_stuck_deltas.append(stuck_delta)
-            stage_collision_deltas.append(collision_delta)
-
-            self._last_reset_count_by_stage[idx] = self._reset_count_by_stage[idx]
-            self._last_invalid_count_by_stage[idx] = self._invalid_count_by_stage[idx]
-            self._last_degraded_count_by_stage[idx] = self._degraded_count_by_stage[idx]
-            self._last_exclude_count_by_stage[idx] = self._exclude_count_by_stage[idx]
-            self._last_success_count_by_stage[idx] = self._success_count_by_stage[idx]
-            self._last_timeout_count_by_stage[idx] = self._timeout_count_by_stage[idx]
-            self._last_stuck_count_by_stage[idx] = self._stuck_count_by_stage[idx]
-            self._last_collision_count_by_stage[idx] = self._collision_count_by_stage[idx]
-
-            self.extras[f"StatsTotals/stage_{idx}_reset_count"] = float(self._reset_count_by_stage[idx])
-            self.extras[f"StatsTotals/stage_{idx}_invalid_count"] = float(self._invalid_count_by_stage[idx])
-            self.extras[f"StatsTotals/stage_{idx}_degraded_count"] = float(self._degraded_count_by_stage[idx])
-            self.extras[f"StatsTotals/stage_{idx}_exclude_count"] = float(self._exclude_count_by_stage[idx])
-            self.extras[f"StatsTotals/stage_{idx}_success_count"] = float(self._success_count_by_stage[idx])
-            self.extras[f"StatsTotals/stage_{idx}_timeout_count"] = float(self._timeout_count_by_stage[idx])
-            self.extras[f"StatsTotals/stage_{idx}_stuck_count"] = float(self._stuck_count_by_stage[idx])
-            self.extras[f"StatsTotals/stage_{idx}_collision_count"] = float(self._collision_count_by_stage[idx])
-
-            self.extras[f"StatsDelta/stage_{idx}_reset_count"] = float(reset_delta)
-            self.extras[f"StatsDelta/stage_{idx}_invalid_count"] = float(invalid_delta)
-            self.extras[f"StatsDelta/stage_{idx}_degraded_count"] = float(degraded_delta)
-            self.extras[f"StatsDelta/stage_{idx}_exclude_count"] = float(exclude_delta)
-            self.extras[f"StatsDelta/stage_{idx}_success_count"] = float(success_delta)
-            self.extras[f"StatsDelta/stage_{idx}_timeout_count"] = float(timeout_delta)
-            self.extras[f"StatsDelta/stage_{idx}_stuck_count"] = float(stuck_delta)
-            self.extras[f"StatsDelta/stage_{idx}_collision_count"] = float(collision_delta)
-
-        log = self.extras.setdefault("log", {})
-        log["curriculum_stage"] = float(self._curriculum_stage)
-        log["curriculum_success_tolerance"] = float(self._curr_success_tolerance)
-        log["curriculum_min_success_rate"] = float(self._curriculum_min_success_rate)
-        log["curriculum_window_size"] = float(self._curriculum_window_size)
-        log["curriculum_use_ik_reachability"] = float(self._curr_use_ik_reachability)
-        log["success_rate_valid"] = float(self._success_rate)
-        log["success_rate_all"] = float(self._success_rate_all)
-        log["success_rate"] = float(self._success_rate)
-        log["invalid_env_fraction"] = float(self._invalid_reset_ema)
-        log["invalid_env_fraction_window"] = float(invalid_window_fraction)
-        log["degraded_target_fraction_recent"] = float(degraded_target_window_fraction)
-        log["degraded_obstacle_fraction_recent"] = float(degraded_obstacle_window_fraction)
-        log["exclude_from_curriculum_fraction_recent"] = float(exclude_window_fraction)
-        log["degraded_env_fraction"] = float(self._degraded_reset_count / max(1, self._total_reset_count))
-        log["repair_attempts_used_avg"] = self._repair_attempts_total / max(1, self._repair_attempts_count)
-        log["target_sample_attempts_avg"] = float(target_attempts_avg)
-        log["Totals/reset_count"] = float(self._total_reset_count)
-        log["Totals/invalid_env_count"] = float(self._invalid_reset_count)
-        log["Totals/degraded_env_count"] = float(self._degraded_reset_count)
-        log["Totals/degraded_target_count"] = float(self._degraded_target_count)
-        log["Totals/degraded_obstacle_count"] = float(self._degraded_obstacle_count)
-        log["Totals/exclude_from_curriculum_count"] = float(self._exclude_from_curriculum_count)
-        log["Totals/target_sample_invalid_distance"] = float(self._target_sample_invalid_distance_total)
-        log["Totals/target_sample_unreachable"] = float(self._target_sample_unreachable_total)
-        log["Totals/target_sample_success"] = float(self._target_sample_success_total)
-        log["Totals/target_sample_attempts"] = float(self._target_sample_attempts_total)
-        log["Delta/reset_count"] = float(reset_count_delta)
-        log["Delta/invalid_env_count"] = float(invalid_count_delta)
-        log["Delta/degraded_env_count"] = float(degraded_count_delta)
-        log["Delta/degraded_target_count"] = float(degraded_target_delta)
-        log["Delta/degraded_obstacle_count"] = float(degraded_obstacle_delta)
-        log["Delta/exclude_from_curriculum_count"] = float(exclude_count_delta)
-        log["Delta/target_sample_invalid_distance"] = float(target_invalid_distance_delta)
-        log["Delta/target_sample_unreachable"] = float(target_unreachable_delta)
-        log["Delta/target_sample_success"] = float(target_success_delta)
-        log["Delta/target_sample_attempts"] = float(target_attempts_delta)
-        for idx in range(len(self._reset_count_by_stage)):
-            log[f"Totals/stage_{idx}_reset_count"] = float(self._reset_count_by_stage[idx])
-            log[f"Totals/stage_{idx}_invalid_count"] = float(self._invalid_count_by_stage[idx])
-            log[f"Totals/stage_{idx}_degraded_count"] = float(self._degraded_count_by_stage[idx])
-            log[f"Totals/stage_{idx}_exclude_count"] = float(self._exclude_count_by_stage[idx])
-            log[f"Totals/stage_{idx}_success_count"] = float(self._success_count_by_stage[idx])
-            log[f"Totals/stage_{idx}_timeout_count"] = float(self._timeout_count_by_stage[idx])
-            log[f"Totals/stage_{idx}_stuck_count"] = float(self._stuck_count_by_stage[idx])
-            log[f"Totals/stage_{idx}_collision_count"] = float(self._collision_count_by_stage[idx])
-            log[f"Delta/stage_{idx}_reset_count"] = float(stage_reset_deltas[idx])
-            log[f"Delta/stage_{idx}_invalid_count"] = float(stage_invalid_deltas[idx])
-            log[f"Delta/stage_{idx}_degraded_count"] = float(stage_degraded_deltas[idx])
-            log[f"Delta/stage_{idx}_exclude_count"] = float(stage_exclude_deltas[idx])
-            log[f"Delta/stage_{idx}_success_count"] = float(stage_success_deltas[idx])
-            log[f"Delta/stage_{idx}_timeout_count"] = float(stage_timeout_deltas[idx])
-            log[f"Delta/stage_{idx}_stuck_count"] = float(stage_stuck_deltas[idx])
-            log[f"Delta/stage_{idx}_collision_count"] = float(stage_collision_deltas[idx])
-
+            log = self.extras.setdefault("log", {})
+            log["curriculum_stage"] = float(self._curriculum_stage)
+            log["success_rate_valid"] = float(self._success_rate)
+            log["success_rate_all"] = float(self._success_rate_all)
+            log["invalid_env_fraction"] = float(self._invalid_reset_ema)
+            log["degraded_target_fraction"] = float(self._degraded_target_ema)
+            log["degraded_obstacle_fraction"] = float(self._degraded_obstacle_ema)
+            log["exclude_from_curriculum_fraction"] = float(self._exclude_from_curriculum_ema)
+            log["repair_attempts_used_avg"] = self._repair_attempts_total / max(1, self._repair_attempts_count)
+            log["collision_fraction"] = collision_count_delta / max(1, reset_count_delta)
         # ---- Buffer resets for new episode ----
         self._joint_targets[env_ids] = joint_pos[:, self._joint_ids]
         self._actions[env_ids] = 0.0
@@ -682,13 +478,9 @@ class RlArmControllerEnv(DirectRLEnv):
             joint_pos = self._robot.data.joint_pos[env_ids][:, self._joint_ids]
             env_origins = self.scene.env_origins[env_ids]
         for i in range(num_envs):
-            attempts_used = 0
             for _ in range(self.cfg.target_resample_attempts):
-                attempts_used += 1
                 candidate = self._sample_uniform_pos(1, self._curr_target_pos_range)[0]
                 if not self._is_target_valid(candidate):
-                    self._target_sample_invalid_distance_batch += 1
-                    self._target_sample_invalid_distance_total += 1
                     continue
                 if self._curr_use_ik_reachability:
                     if not self._is_target_reachable(
@@ -698,17 +490,9 @@ class RlArmControllerEnv(DirectRLEnv):
                         joint_pos[i : i + 1],
                         env_origins[i : i + 1],
                     ):
-                        self._target_sample_unreachable_batch += 1
-                        self._target_sample_unreachable_total += 1
                         continue
                 valid_mask[i] = True
                 target_pos[i] = candidate
-                self._target_sample_success_batch += 1
-                self._target_sample_success_total += 1
-                self._target_sample_attempts_batch += attempts_used
-                self._target_sample_attempts_batch_count += 1
-                self._target_sample_attempts_total += attempts_used
-                self._target_sample_attempts_count += 1
                 break
         self._target_pos[env_ids] = target_pos
         self._update_target_markers()
@@ -957,9 +741,6 @@ class RlArmControllerEnv(DirectRLEnv):
                 self._success_rate_all = self._episode_success_history_all.mean().item()
         else:
             self._success_rate_all = 0.0
-        self.extras["Stats/success_rate_valid"] = float(self._success_rate)
-        self.extras["Stats/success_rate_all"] = float(self._success_rate_all)
-        self.extras["Stats/success_rate"] = float(self._success_rate)
         if (
             self._curriculum_enabled
             and self._episode_history_filled >= window_size

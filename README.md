@@ -8,7 +8,7 @@
 ![Python](https://img.shields.io/badge/Python-3.11-3776ab?style=for-the-badge&logo=python&logoColor=white)
 
 **Obstacle-aware reaching for a FANUC LR Mate 200iC/5L + SG2 tool using Isaac Lab DirectRLEnv.**  
-Train a PPO policy to reach a target TCP pose while avoiding randomized obstacles, including partially or fully infeasible layouts.
+Train a PPO policy to reach a target TCP position while avoiding randomized obstacles, including partially or fully infeasible layouts.
 
 </div>
 
@@ -40,7 +40,7 @@ Train a PPO policy to reach a target TCP pose while avoiding randomized obstacle
 
 This repository implements a **direct-workflow RL manipulation task** (Isaac Lab `DirectRLEnv`) for a 6-DOF industrial arm:
 - Reach a sampled 3D target TCP pose
-- Avoid collisions with 1 to 2 rigid obstacles
+- Avoid collisions with 0 to 2 rigid obstacles
 - Produce smooth, bounded joint motion under randomized scene layouts
 
 The design explicitly addresses a common manipulation RL reality:
@@ -148,9 +148,23 @@ python scripts/zero_agent.py --task Isaac-Reach-Fanuc-v0
 python scripts/rsl_rl/train.py --task Isaac-Reach-Fanuc-v0 --headless
 ```
 
+### 5b) View training metrics (TensorBoard)
+```bash
+# All runs for this experiment
+tensorboard serve --logdir logs/rsl_rl/reach_fanuc
+
+# Or a single run
+tensorboard serve --logdir logs/rsl_rl/reach_fanuc/<run_dir>
+```
+Open `http://localhost:6006` in a browser.
+
 ### 6) Play a trained checkpoint
 ```bash
-python scripts/rsl_rl/play.py --task Isaac-Reach-Fanuc-v0 --num_envs 32 --load_run <run_dir> --checkpoint <model.pt>
+# Option A: let play.py pick the latest checkpoint in the run folder
+python scripts/rsl_rl/play.py --task Isaac-Reach-Fanuc-v0 --num_envs 32 --load_run <run_dir>
+
+# Option B: specify a full path to the checkpoint file
+python scripts/rsl_rl/play.py --task Isaac-Reach-Fanuc-v0 --num_envs 32 --checkpoint logs/rsl_rl/reach_fanuc/<run_dir>/model_499.pt
 ```
 
 ---
@@ -169,9 +183,6 @@ python scripts/rsl_rl/train.py --task Isaac-Reach-Fanuc-v0 --headless
 ```bash
 C:\repos\IsaacLab\isaaclab.bat -p scripts\rsl_rl\train.py --task Isaac-Reach-Fanuc-v0 --headless
 ```
-
-python scripts/rsl_rl/play.py --task Isaac-Reach-Fanuc-v0 --num_envs 32 --checkpoint logs/rsl_rl/reach_fanuc/2025-12-31_19-58-01/model_499.pt
-
 ---
 
 ## ✅ Verify your setup
@@ -209,6 +220,26 @@ High-level objectives:
 - Avoid collisions with obstacles
 - Encourage smooth, bounded joint motion
 
+Environment IO:
+- Actions: 6D joint delta targets (scaled, clamped to joint limits)
+- Observations: scaled joint positions, joint velocities, TCP-to-target vector, optional obstacle-relative positions, optional previous actions
+- Termination: success, collision (if enabled), timeout, optional stuck detection
+
+### Reward breakdown (default scales)
+
+| Term | Description | Scale | Notes |
+|---|---|---|---|
+| distance | -dist(TCP, target) | 0.1 | Always on |
+| success | +reward on success | 100.0 | `dist < success_tolerance` |
+| success_time | +time bonus on success | 50.0 | Scales with earlier success |
+| progress | +previous_dist - dist | 1.0 | Only after first step |
+| action_l2 | -sum(action^2) | -0.01 | Smoothness penalty |
+| action_rate | -sum((a_t - a_{t-1})^2) | -0.01 | Penalizes jerks |
+| joint_vel_l2 | -sum(joint_vel^2) | -0.005 | Damps motion |
+| collision | +penalty on collision | -10.0 | Once per episode by default |
+| approach | +align TCP forward to target | 0.0 | Enabled if nonzero |
+| proximity | +min_dist - radius | 1.0 | Only when inside `proximity_radius` |
+
 ---
 
 ## 🧠 Environment design
@@ -225,8 +256,9 @@ Conceptually, this is closest to how you would write a custom env for real manip
 ### Scene sampling
 - Targets are sampled within bounded workspace limits
 - A reachability check is applied before obstacle placement (IK ignoring obstacles)
-- Obstacles are spawned as rigid bodies with contact sensing
+- Obstacles are spawned as rigid bodies with contact sensing and optional line-of-sight clearance checks
 - Rewards include distance-to-target, smoothness penalties, and collision penalties
+ - Optional forced path obstacle placement for harder avoidance scenarios
 
 ### Curriculum learning
 Difficulty increases when the rolling success rate reaches thresholds:
@@ -246,14 +278,18 @@ source/RL_Arm_Controller/RL_Arm_Controller/tasks/direct/rl_arm_controller/rl_arm
 Randomized scenes can be invalid (no feasible placement after retries). When sampling fails:
 - Target is placed near the current TCP
 - Obstacles are moved outside the active workspace
-- Episode is timed out with zero reward
+- Degraded resets are excluded from curriculum stats; invalid resets receive zero reward and immediate timeout
 
-Logged metrics (via `self.extras`) include:
-- `Stats/success_rate`
+Logged metrics (via `self.extras`) include (emitted every `env.stats_log_interval` resets):
+- `Stats/success_rate_valid`
+- `Stats/success_rate_all`
 - `Stats/curriculum_stage`
 - `Stats/invalid_env_fraction`
-- `Stats/invalid_env_count`
-- `Stats/reset_count`
+- `Stats/degraded_target_fraction`
+- `Stats/degraded_obstacle_fraction`
+- `Stats/exclude_from_curriculum_fraction`
+- `Stats/repair_attempts_used_avg`
+- `Stats/collision_fraction`
 
 These are important because parallel RL can silently waste samples if invalid resets are not tracked.
 
